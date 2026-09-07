@@ -62,6 +62,7 @@
 
 // system includes
 #include <array>
+#include <functional>
 #include <math.h>
 #include <stdlib.h>
 
@@ -2138,8 +2139,9 @@ void PageView::keyPressEvent(QKeyEvent *e)
     case Qt::Key_Left:
     case Qt::Key_H:
         if (horizontalScrollBar()->maximum() == 0) {
-            // if we cannot scroll we go to the previous page vertically
-            int next_page = d->document->currentPage() - viewColumns();
+            // if we cannot scroll we go to the previous row;
+            // setViewportPage() clamps the -1 (no previous row) to the first page
+            int next_page = pageInAdjacentRow(d->document->currentPage(), false);
             d->document->setViewportPage(next_page);
         } else {
             d->scroller->scrollTo(d->scroller->finalPosition() + QPoint(-stepsize * horizontalScrollBar()->singleStep(), 0), d->currentShortScrollDuration);
@@ -2148,9 +2150,11 @@ void PageView::keyPressEvent(QKeyEvent *e)
     case Qt::Key_Right:
     case Qt::Key_L:
         if (horizontalScrollBar()->maximum() == 0) {
-            // if we cannot scroll we advance the page vertically
-            int next_page = d->document->currentPage() + viewColumns();
-            d->document->setViewportPage(next_page);
+            // if we cannot scroll we advance to the next row
+            int next_page = pageInAdjacentRow(d->document->currentPage(), true);
+            if (next_page >= 0) {
+                d->document->setViewportPage(next_page);
+            }
         } else {
             d->scroller->scrollTo(d->scroller->finalPosition() + QPoint(stepsize * horizontalScrollBar()->singleStep(), 0), d->currentShortScrollDuration);
         }
@@ -3415,10 +3419,8 @@ void PageView::wheelEvent(QWheelEvent *e)
             if ((int)d->document->currentPage() < d->items.count() - 1) {
                 // more optimized than document->setNextPage and then move view to top
                 Okular::DocumentViewport newViewport = d->document->viewport();
-                newViewport.pageNumber += viewColumns();
-                if (newViewport.pageNumber >= (int)d->items.count()) {
-                    newViewport.pageNumber = d->items.count() - 1;
-                }
+                const int targetPage = pageInAdjacentRow(d->document->currentPage(), true);
+                newViewport.pageNumber = targetPage < 0 ? d->items.count() - 1 : targetPage;
                 newViewport.rePos.enabled = true;
                 newViewport.rePos.normalizedY = 0.0;
                 d->document->setViewport(newViewport);
@@ -3433,10 +3435,8 @@ void PageView::wheelEvent(QWheelEvent *e)
             if (d->document->currentPage() > 0) {
                 // more optimized than document->setPrevPage and then move view to bottom
                 Okular::DocumentViewport newViewport = d->document->viewport();
-                newViewport.pageNumber -= viewColumns();
-                if (newViewport.pageNumber < 0) {
-                    newViewport.pageNumber = 0;
-                }
+                const int targetPage = pageInAdjacentRow(d->document->currentPage(), false);
+                newViewport.pageNumber = targetPage < 0 ? 0 : targetPage;
                 newViewport.rePos.enabled = true;
                 newViewport.rePos.normalizedY = 1.0;
                 d->document->setViewport(newViewport);
@@ -4011,12 +4011,21 @@ double PageView::zoomFactorFitMode(ZoomMode mode)
     const bool overrideCentering = facingCentered && pageCount < 3;
     const int nCols = overrideCentering ? 1 : viewColumns();
     const int rowHeightMargin = Okular::Settings::rowSpacing();
-    const int colWidth = viewport()->width() / nCols - kcolWidthMargin;
+    const int singleColWidth = viewport()->width() / nCols - kcolWidthMargin;
     const double rowHeight = viewport()->height() - rowHeightMargin;
     const PageViewItem *currentItem = d->items[qMax(0, (int)d->document->currentPage())];
     // prevent segmentation fault when opening a new document;
     if (!currentItem) {
         return 0;
+    }
+
+    // For full-width pages in facing mode, use full row width
+    const int currentPageNum = qMax(0, (int)d->document->currentPage());
+    const bool facing = Okular::Settings::viewMode() == Okular::Settings::EnumViewMode::Facing && pageCount > 1;
+    const bool facingPages = facing || facingCentered;
+    int colWidth = singleColWidth;
+    if (facingPages && isPageFullWidthInFacing(currentPageNum)) {
+        colWidth = (viewport()->width() / nCols) * nCols - kcolWidthMargin;
     }
 
     // We need the real width/height of the cropped page.
@@ -4423,6 +4432,122 @@ int PageView::viewColumns() const
     }
 }
 
+bool PageView::isPageFullWidthInFacing(int pageNumber) const
+{
+    const int pageCount = d->items.count();
+    if (pageCount < 1 || pageNumber < 0 || pageNumber >= pageCount) {
+        return false;
+    }
+
+    const int vm = Okular::Settings::viewMode();
+    const bool facing = vm == Okular::Settings::EnumViewMode::Facing && pageCount > 1;
+    const bool facingCentered = vm == Okular::Settings::EnumViewMode::FacingFirstCentered || (vm == Okular::Settings::EnumViewMode::Facing && pageCount == 1);
+    if (!facing && !facingCentered) {
+        return false;
+    }
+
+    const Okular::Page *page = d->document->page(pageNumber);
+    if (!page) {
+        return false;
+    }
+
+    // Landscape pages (width > height) always take full width
+    if (page->width() > page->height()) {
+        return true;
+    }
+
+    return false;
+}
+
+namespace {
+
+// For each page: the row it belongs to, its slot within the row and whether
+// it takes the full row (landscape page in facing mode).
+struct PageGridLayout
+{
+    QList<int> row;
+    QList<int> slot;
+    QList<bool> full;
+};
+
+// Shared by slotRelayoutPages() and the row-based navigation helpers so that
+// the layout and the navigation can never disagree about the row structure.
+PageGridLayout computePageGridLayout(int pageCount, int nCols, bool centerFirstPage, const std::function<bool(int)> &isFullRowPage)
+{
+    PageGridLayout layout;
+    layout.row.resize(pageCount);
+    layout.slot.resize(pageCount);
+    layout.full.assign(pageCount, false);
+    int row = 0;
+    int slot = centerFirstPage ? nCols - 1 : 0;
+    bool rowHasPage = false;
+    for (int i = 0; i < pageCount; i++) {
+        const bool fullRowPage = isFullRowPage(i);
+        // a full-row page must not share a row with a page already placed in it
+        if (fullRowPage && rowHasPage) {
+            row++;
+            slot = 0;
+            rowHasPage = false;
+        }
+        layout.row[i] = row;
+        layout.slot[i] = slot;
+        if (fullRowPage) {
+            layout.full[i] = true;
+            row++;
+            slot = 0;
+            rowHasPage = false;
+        } else {
+            slot++;
+            rowHasPage = true;
+            if (slot == nCols) {
+                slot = 0;
+                row++;
+                rowHasPage = false;
+            }
+        }
+    }
+    return layout;
+}
+
+}
+
+int PageView::pageInAdjacentRow(int pageNumber, bool nextRow) const
+// returns the page in the row below/above the one containing pageNumber,
+// preferring the page in the same slot; -1 if there is no such row
+{
+    const int pageCount = d->items.count();
+    if (pageCount < 2 || pageNumber < 0 || pageNumber >= pageCount) {
+        return -1;
+    }
+
+    const bool facing = Okular::Settings::viewMode() == Okular::Settings::EnumViewMode::Facing && pageCount > 1;
+    const bool facingCentered = Okular::Settings::viewMode() == Okular::Settings::EnumViewMode::FacingFirstCentered || (Okular::Settings::viewMode() == Okular::Settings::EnumViewMode::Facing && pageCount == 1);
+    const bool overrideCentering = facingCentered && pageCount < 3;
+    const bool centerFirstPage = facingCentered && !overrideCentering;
+    const bool facingPages = facing || centerFirstPage;
+    const int nCols = overrideCentering ? 1 : viewColumns();
+
+    const PageGridLayout layout = computePageGridLayout(pageCount, nCols, centerFirstPage, [this, facingPages](int i) {
+        return facingPages && isPageFullWidthInFacing(i);
+    });
+    const int nRows = layout.row.last() + 1;
+    const int targetRow = layout.row[pageNumber] + (nextRow ? 1 : -1);
+    if (targetRow < 0 || targetRow >= nRows) {
+        return -1;
+    }
+
+    int target = -1;
+    for (int i = 0; i < pageCount; i++) {
+        if (layout.row[i] == targetRow) {
+            target = i;
+            if (layout.slot[i] == layout.slot[pageNumber]) {
+                break;
+            }
+        }
+    }
+    return target;
+}
+
 void PageView::center(int cx, int cy, bool smoothMove)
 {
     scrollTo(cx - viewport()->width() / 2, cy - viewport()->height() / 2, smoothMove);
@@ -4748,7 +4873,6 @@ void PageView::slotRelayoutPages()
     const bool overrideCentering = facingCentered && pageCount < 3;
     const bool centerFirstPage = facingCentered && !overrideCentering;
     const bool facingPages = facing || centerFirstPage;
-    const bool centerLastPage = centerFirstPage && pageCount % 2 == 0;
     const bool continuousView = getContinuousMode();
     const int nCols = overrideCentering ? 1 : viewColumns();
     const bool singlePageViewMode = Okular::Settings::viewMode() == Okular::Settings::EnumViewMode::Single;
@@ -4760,110 +4884,130 @@ void PageView::slotRelayoutPages()
 
     // set all items geometry and resize contents. handle 'continuous' and 'single' modes separately
 
-    const PageViewItem *currentItem = d->items[qMax(0, (int)d->document->currentPage())];
-
     // Here we find out column's width and row's height to compute a table
     // so we can place widgets 'centered in virtual cells'.
-    const int nRows = (int)ceil((float)(centerFirstPage ? (pageCount + nCols - 1) : pageCount) / (float)nCols);
+    // Determine the row, the slot within the row and whether each page takes the full row.
+    // In facing mode landscape pages take the full row, all other pages share rows of nCols slots.
+    const PageGridLayout pageLayout = computePageGridLayout(pageCount, nCols, centerFirstPage, [this, facingPages](int i) {
+        return facingPages && isPageFullWidthInFacing(i);
+    });
+    const QList<int> &pageRow = pageLayout.row;
+    const QList<int> &pageSlot = pageLayout.slot;
+    const QList<bool> &pageFull = pageLayout.full;
+    // rows are filled without gaps, so the highest used row index plus one is the row count
+    const int nRows = pageRow.last() + 1;
 
-    int *colWidth = new int[nCols], *rowHeight = new int[nRows], cIdx = 0, rIdx = 0;
+    // number of pages in each row; pages without a facing partner in their row
+    // (e.g. an orphan portrait next to a full-row landscape page) get centered
+    QList<int> rowPageCount(nRows, 0);
+    for (int i = 0; i < pageCount; i++) {
+        rowPageCount[pageRow[i]]++;
+    }
+
+    int *colWidth = new int[nCols], *rowHeight = new int[nRows];
     for (int i = 0; i < nCols; i++) {
         colWidth[i] = viewportWidth / nCols;
     }
     for (int i = 0; i < nRows; i++) {
         rowHeight[i] = 0;
     }
-    // handle the 'centering on first row' stuff
-    if (centerFirstPage) {
-        cIdx += nCols - 1;
-    }
 
     // 1) find the maximum columns width and rows height for a grid in
     // which each page must well-fit inside a cell
-    for (PageViewItem *item : std::as_const(d->items)) {
+    int fullRowWidth = colWidth[0] * nCols;
+    for (int i = 0; i < pageCount; i++) {
+        PageViewItem *item = d->items[i];
+        const int r = pageRow[i];
+        const int c = pageFull[i] ? 0 : pageSlot[i];
+        // full-row pages (landscape pages in facing mode) are sized to the full row width
+        int pageColWidth = pageFull[i] ? fullRowWidth - kcolWidthMargin : colWidth[c] - kcolWidthMargin;
         // update internal page size (leaving a little margin in case of Fit* modes)
-        updateItemSize(item, colWidth[cIdx] - kcolWidthMargin, viewportHeight - rowHeightMargin);
+        updateItemSize(item, pageColWidth, viewportHeight - rowHeightMargin);
         // find row's maximum height and column's max width
-        if (item->croppedWidth() + kcolWidthMargin > colWidth[cIdx]) {
-            colWidth[cIdx] = item->croppedWidth() + kcolWidthMargin;
+        if (pageFull[i]) {
+            if (item->croppedWidth() + kcolWidthMargin > fullRowWidth) {
+                fullRowWidth = item->croppedWidth() + kcolWidthMargin;
+                for (int j = 0; j < nCols; j++) {
+                    colWidth[j] = fullRowWidth / nCols;
+                }
+            }
+        } else if (item->croppedWidth() + kcolWidthMargin > colWidth[c]) {
+            colWidth[c] = item->croppedWidth() + kcolWidthMargin;
         }
-        if (item->croppedHeight() + rowHeightMargin > rowHeight[rIdx]) {
-            rowHeight[rIdx] = item->croppedHeight() + rowHeightMargin;
-        }
-        // handle the 'centering on first row' stuff
-        // update col/row indices
-        if (++cIdx == nCols) {
-            cIdx = 0;
-            rIdx++;
+        if (item->croppedHeight() + rowHeightMargin > rowHeight[r]) {
+            rowHeight[r] = item->croppedHeight() + rowHeightMargin;
         }
     }
-
-    const int pageRowIdx = ((centerFirstPage ? nCols - 1 : 0) + currentItem->pageNumber()) / nCols;
 
     // 2) compute full size
     for (int i = 0; i < nCols; i++) {
         fullWidth += colWidth[i];
     }
+
+    // current page's row index (needed for visibility in non-continuous mode)
+    const int currentPage = qMax(0, (int)d->document->currentPage());
+    const int currentPageRow = pageRow[currentPage];
+
     if (continuousView) {
         for (int i = 0; i < nRows; i++) {
             fullHeight += rowHeight[i];
         }
     } else {
-        fullHeight = rowHeight[pageRowIdx];
+        fullHeight = rowHeight[currentPageRow];
     }
 
     // 3) arrange widgets inside cells (and refine fullHeight if needed)
-    int insertX = 0, insertY = fullHeight < viewportHeight ? (viewportHeight - fullHeight) / 2 : 0;
+    int insertY = fullHeight < viewportHeight ? (viewportHeight - fullHeight) / 2 : 0;
     const int origInsertY = insertY;
-    cIdx = 0;
-    rIdx = 0;
-    if (centerFirstPage) {
-        cIdx += nCols - 1;
-        for (int i = 0; i < cIdx; ++i) {
-            insertX += colWidth[i];
-        }
+
+    // top offset of every row (for continuous view)
+    QList<int> rowTop(nRows, 0);
+    for (int r = 1; r < nRows; r++) {
+        rowTop[r] = rowTop[r - 1] + rowHeight[r - 1];
     }
-    for (PageViewItem *item : std::as_const(d->items)) {
-        int cWidth = colWidth[cIdx], rHeight = rowHeight[rIdx];
-        if (continuousView || rIdx == pageRowIdx) {
-            const bool reallyDoCenterFirst = item->pageNumber() == 0 && centerFirstPage;
-            const bool reallyDoCenterLast = item->pageNumber() == pageCount - 1 && centerLastPage;
-            int actualX = 0;
-            if (reallyDoCenterFirst || reallyDoCenterLast) {
-                // page is centered across entire viewport
-                actualX = (fullWidth - item->croppedWidth()) / 2;
-            } else if (facingPages) {
-                if (Okular::Settings::rtlReadingDirection()) {
-                    // RTL reading mode
-                    actualX = ((centerFirstPage && item->pageNumber() % 2 == 0) || (!centerFirstPage && item->pageNumber() % 2 == 1)) ? (fullWidth / 2) - item->croppedWidth() - 1 : (fullWidth / 2) + 1;
-                } else {
-                    // page edges 'touch' the center of the viewport
-                    actualX = ((centerFirstPage && item->pageNumber() % 2 == 1) || (!centerFirstPage && item->pageNumber() % 2 == 0)) ? (fullWidth / 2) - item->croppedWidth() - 1 : (fullWidth / 2) + 1;
-                }
-            } else {
-                // page is centered within its virtual column
-                // actualX = insertX + (cWidth - item->croppedWidth()) / 2;
-                if (Okular::Settings::rtlReadingDirection()) {
-                    actualX = fullWidth - insertX - cWidth + ((cWidth - item->croppedWidth()) / 2);
-                } else {
-                    actualX = insertX + (cWidth - item->croppedWidth()) / 2;
-                }
+    // left offset of every column
+    QList<int> colLeft(nCols, 0);
+    for (int c = 1; c < nCols; c++) {
+        colLeft[c] = colLeft[c - 1] + colWidth[c - 1];
+    }
+
+    for (int i = 0; i < pageCount; i++) {
+        PageViewItem *item = d->items[i];
+        const int r = pageRow[i];
+        const int c = pageFull[i] ? 0 : pageSlot[i];
+        const int cWidth = colWidth[c];
+        const int rHeight = rowHeight[r];
+
+        // Determine X position
+        int actualX;
+        if (facingPages && rowPageCount[r] == 1) {
+            // full-row page, or a page without a facing partner in its row:
+            // centered across the entire viewport
+            actualX = (fullWidth - item->croppedWidth()) / 2;
+        } else if (facingPages) {
+            // page edges 'touch' the center of the viewport
+            bool isLeftSide = (pageSlot[i] == 0);
+            if (Okular::Settings::rtlReadingDirection()) {
+                isLeftSide = !isLeftSide;
             }
-            item->moveTo(actualX, (continuousView ? insertY : origInsertY) + (rHeight - item->croppedHeight()) / 2);
+            actualX = isLeftSide ? (fullWidth / 2) - item->croppedWidth() - 1 : (fullWidth / 2) + 1;
+        } else {
+            // page is centered within its virtual column
+            if (Okular::Settings::rtlReadingDirection()) {
+                actualX = fullWidth - colLeft[c] - cWidth + ((cWidth - item->croppedWidth()) / 2);
+            } else {
+                actualX = colLeft[c] + (cWidth - item->croppedWidth()) / 2;
+            }
+        }
+
+        if (continuousView || r == currentPageRow) {
+            item->moveTo(actualX, (continuousView ? rowTop[r] : origInsertY) + (rHeight - item->croppedHeight()) / 2);
             item->setVisible(true);
         } else {
             item->moveTo(0, 0);
             item->setVisible(false);
         }
         item->setFormWidgetsVisible(d->m_formsVisible);
-        // advance col/row index
-        insertX += cWidth;
-        if (++cIdx == nCols) {
-            cIdx = 0;
-            rIdx++;
-            insertX = 0;
-            insertY += rHeight;
-        }
 #ifdef PAGEVIEW_DEBUG
         qWarning() << "updating size for pageno" << item->pageNumber() << "cropped" << item->croppedGeometry() << "uncropped" << item->uncroppedGeometry();
 #endif
@@ -5464,13 +5608,11 @@ void PageView::slotScrollUp(int nSteps)
             }
         }
     } else if (!getContinuousMode() && d->document->currentPage() > 0) {
-        // Since we are in single page mode and at the top of the page, go to previous page.
+        // Since we are in single page mode and at the top of the page, go to the previous row.
         // setViewport() is more optimized than document->setPrevPage and then move view to bottom.
         Okular::DocumentViewport newViewport = d->document->viewport();
-        newViewport.pageNumber -= viewColumns();
-        if (newViewport.pageNumber < 0) {
-            newViewport.pageNumber = 0;
-        }
+        const int targetPage = pageInAdjacentRow(d->document->currentPage(), false);
+        newViewport.pageNumber = targetPage < 0 ? 0 : targetPage;
         newViewport.rePos.enabled = true;
         newViewport.rePos.normalizedY = 1.0;
         d->document->setViewport(newViewport);
@@ -5488,13 +5630,11 @@ void PageView::slotScrollDown(int nSteps)
             }
         }
     } else if (!getContinuousMode() && (int)d->document->currentPage() < d->items.count() - 1) {
-        // Since we are in single page mode and at the bottom of the page, go to next page.
+        // Since we are in single page mode and at the bottom of the page, go to the next row.
         // setViewport() is more optimized than document->setNextPage and then move view to top
         Okular::DocumentViewport newViewport = d->document->viewport();
-        newViewport.pageNumber += viewColumns();
-        if (newViewport.pageNumber >= (int)d->items.count()) {
-            newViewport.pageNumber = d->items.count() - 1;
-        }
+        const int targetPage = pageInAdjacentRow(d->document->currentPage(), true);
+        newViewport.pageNumber = targetPage < 0 ? d->items.count() - 1 : targetPage;
         newViewport.rePos.enabled = true;
         newViewport.rePos.normalizedY = 0.0;
         d->document->setViewport(newViewport);

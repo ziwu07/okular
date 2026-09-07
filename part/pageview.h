@@ -235,6 +235,8 @@ private:
     void updateMagnifier(const QPoint p);
 
     int viewColumns() const;
+    bool isPageFullWidthInFacing(int pageNumber) const;
+    int pageInAdjacentRow(int pageNumber, bool nextRow) const;
 
     void center(int cx, int cy, bool smoothMove = false);
     void scrollTo(int x, int y, bool smoothMove = false);
